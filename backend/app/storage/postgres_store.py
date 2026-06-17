@@ -110,16 +110,22 @@ async def list_reviews(db: AsyncSession, limit: int = 20, offset: int = 0) -> Li
 
 async def bulk_insert_findings(db: AsyncSession, review_id: UUID, findings: List[dict]) -> None:
     for f in findings:
+        raw_cwe = f.get("cwe_reference") or f.get("cwe")
+        cwe_str = str(raw_cwe) if raw_cwe is not None else None
+
+        raw_line = f.get("line_number")
+        line_int = int(raw_line) if raw_line is not None and str(raw_line).isdigit() else None
+
         finding = Finding(
             review_id=review_id,
             agent_name=f.get("agent_name"),
-            severity=f.get("severity", "info"),
+            severity=str(f.get("severity", "info")).lower(),
             category=f.get("category"),
             issue=f.get("issue"),
             recommendation=f.get("recommendation"),
             file_path=f.get("file_path"),
-            line_number=f.get("line_number"),
-            cwe_reference=f.get("cwe_reference") or f.get("cwe"),
+            line_number=line_int,
+            cwe_reference=cwe_str,
         )
         db.add(finding)
 

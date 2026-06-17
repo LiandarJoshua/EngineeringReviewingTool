@@ -17,8 +17,13 @@ class TestCoverageSkill(BaseSkill):
         title        = pr_context.get("pr_title", "")
         changed_files = pr_context.get("changed_files", [])
 
-        test_files   = [f for f in changed_files if "test" in f.lower() or "spec" in f.lower()]
-        source_files = [f for f in changed_files if f not in test_files]
+        # changed_files may be dicts {filename, status, ...} or plain strings
+        def _fname(f) -> str:
+            return f.get("filename", f.get("path", "")) if isinstance(f, dict) else str(f)
+
+        file_names   = [_fname(f) for f in changed_files]
+        test_files   = [f for f in file_names if "test" in f.lower() or "spec" in f.lower()]
+        source_files = [f for f in file_names if f not in test_files]
 
         prompt = f"""You are a test quality reviewer.
 

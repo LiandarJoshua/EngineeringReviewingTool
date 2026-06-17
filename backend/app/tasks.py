@@ -4,13 +4,16 @@ from app.worker import celery_app
 from app.agents.state import ALL_STAGES
 
 
-@celery_app.task(bind=True, name="app.tasks.run_review")
+@celery_app.task(bind=True, name="app.tasks.run_review", queue="reviews")
 def run_review(self, review_id: str, repo_url: str, user_id: str, pdf_path: str = None):
+    import logging
+    log = logging.getLogger(__name__)
+
     from app.agents.orchestrator import build_review_graph
     from app.storage.redis_cache import publish_progress, is_cancelled, set_task_id
 
-    # Store task id so cancel endpoint can revoke it
     set_task_id(review_id, self.request.id)
+    _update_review_status(review_id, "running")
 
     graph = build_review_graph()
     initial_state = {
@@ -47,44 +50,63 @@ def run_review(self, review_id: str, repo_url: str, user_id: str, pdf_path: str 
             stage = list(event.keys())[0]
             loop.run_until_complete(publish_progress(review_id, stage, "complete"))
             final_state = list(event.values())[0]
+    except Exception as e:
+        log.error("run_review pipeline failed for %s: %s", review_id, e, exc_info=True)
+        _update_review_status(review_id, "failed")
+        raise
     finally:
         loop.close()
 
-    if final_state:
-        _persist_results(review_id, final_state)
+    try:
+        if final_state:
+            _persist_results(review_id, final_state)
+        else:
+            log.warning("run_review %s: pipeline produced no final state — marking complete with no scores", review_id)
+            _update_review_status(review_id, "complete")
+    except Exception as e:
+        log.error("run_review %s: _persist_results failed: %s", review_id, e, exc_info=True)
+        _update_review_status(review_id, "complete")  # still mark done so UI unblocks
 
     return {"status": "complete", "review_id": review_id}
 
 
-def _mark_cancelled_in_db(review_id: str) -> None:
-    from uuid import UUID
-    from app.db.session import AsyncSessionLocal
-    from app.storage.postgres_store import update_review_status
-
-    async def _write():
-        async with AsyncSessionLocal() as db:
-            await update_review_status(db, UUID(review_id), "cancelled")
-            await db.commit()
-
+def _run_in_new_loop(coro):
+    """Run an async coroutine in a fresh event loop (safe for Celery tasks)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_write())
+        return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def _update_review_status(review_id: str, status: str) -> None:
+    from uuid import UUID
+    from app.db.session import get_task_db
+    from app.storage.postgres_store import update_review_status
+
+    async def _write():
+        async with get_task_db() as db:
+            await update_review_status(db, UUID(review_id), status)
+
+    _run_in_new_loop(_write())
+
+
+def _mark_cancelled_in_db(review_id: str) -> None:
+    _update_review_status(review_id, "cancelled")
 
 
 def _persist_results(review_id: str, state: dict) -> None:
     from uuid import UUID
     from sqlalchemy import select, desc
-    from app.db.session import AsyncSessionLocal
+    from app.db.session import get_task_db
     from app.db.models import DeveloperProgress
     from app.storage.postgres_store import (
         update_review_scores, bulk_insert_findings, record_progress
     )
 
     async def _write():
-        async with AsyncSessionLocal() as db:
+        async with get_task_db() as db:
             new_scores = state.get("scores", {})
             await update_review_scores(db, UUID(review_id), new_scores, state.get("final_report", {}))
             await bulk_insert_findings(db, UUID(review_id), state.get("prioritized_findings", []))
@@ -94,7 +116,7 @@ def _persist_results(review_id: str, state: dict) -> None:
                     UUID(review_id), new_scores,
                 )
 
-            # Regression detection — compare new overall score to previous
+            # Regression detection
             if state.get("repo_id") and new_scores.get("overall") is not None:
                 prev = await db.execute(
                     select(DeveloperProgress)
@@ -114,14 +136,7 @@ def _persist_results(review_id: str, state: dict) -> None:
                             scores=new_scores,
                         )
 
-            await db.commit()
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_write())
-    finally:
-        loop.close()
+    _run_in_new_loop(_write())
 
 
 def _flag_regression(repo_url: str, new_score: float, prev_score: float, drop: float, scores: dict) -> None:
@@ -182,27 +197,21 @@ The overall code health score has dropped **{drop:.0f} points** since the last r
         logging.getLogger(__name__).warning("Failed to create regression issue: %s", e)
 
 
-@celery_app.task(bind=True, name="app.tasks.run_coaching")
+@celery_app.task(bind=True, name="app.tasks.run_coaching", queue="reviews")
 def run_coaching(self, review_id: str, user_id: str, experience_level: str = "mid"):
     """Generate a coaching report from stored findings and scores."""
     from uuid import UUID
-    from app.db.session import AsyncSessionLocal
+    from app.db.session import get_task_db
     from app.storage.postgres_store import get_review_by_id, get_findings
     from app.agents.stage_09_coaching import run as coaching_run
-    import asyncio
 
     async def _load():
-        async with AsyncSessionLocal() as db:
+        async with get_task_db() as db:
             review = await get_review_by_id(db, UUID(review_id))
             findings = await get_findings(db, UUID(review_id), limit=200)
             return review, findings
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        review, findings = loop.run_until_complete(_load())
-    finally:
-        loop.close()
+    review, findings = _run_in_new_loop(_load())
 
     if not review:
         return {"status": "error", "message": "Review not found"}
@@ -248,20 +257,15 @@ def run_coaching(self, review_id: str, user_id: str, experience_level: str = "mi
     async def _save():
         from sqlalchemy import select
         from app.db.models import Review
-        async with AsyncSessionLocal() as db:
+        from app.db.session import get_task_db as _task_db
+        async with _task_db() as db:
             r = (await db.execute(select(Review).where(Review.id == UUID(review_id)))).scalar_one_or_none()
             if r:
                 raw = dict(r.raw_output or {})
                 raw["coaching_report"] = coaching_report
                 r.raw_output = raw
-                await db.commit()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_save())
-    finally:
-        loop.close()
+    _run_in_new_loop(_save())
 
     return {"status": "complete", "review_id": review_id}
 

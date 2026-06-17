@@ -89,13 +89,11 @@ def run(
 
     # ── Step 5: apply labels & guardrails ────────────────────────────────────
     labels = []
-    review_event = "COMMENT"
 
     if _blocking_issues(all_findings) or score < quality_threshold:
         labels.append("ai:needs-human-review")
         if score < quality_threshold:
             labels.append("ai:quality-gate-failed")
-        review_event = "REQUEST_CHANGES"
     else:
         labels.append("ai:reviewed")
 
@@ -213,6 +211,33 @@ def _build_inline_comments(findings: list[dict], pr_context: dict) -> list[dict]
     return comments
 
 
+def _valid_diff_lines(gh: Any, pr_number: int) -> set[tuple[str, int]]:
+    """Return set of (file_path, line_number) pairs present in the PR diff."""
+    valid: set[tuple[str, int]] = set()
+    try:
+        raw_diff = gh.get_pr_diff(pr_number)
+        current_file = None
+        right_line   = 0
+        for line in raw_diff.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+                right_line   = 0
+            elif line.startswith("@@ "):
+                # @@ -a,b +c,d @@ — extract start of right side
+                import re
+                m = re.search(r"\+(\d+)", line)
+                right_line = int(m.group(1)) - 1 if m else 0
+            elif current_file:
+                if line.startswith("-"):
+                    continue          # left side only — skip
+                right_line += 1
+                if line.startswith("+") or line.startswith(" "):
+                    valid.add((current_file, right_line))
+    except Exception as e:
+        log.warning("Could not parse PR diff for line validation: %s", e)
+    return valid
+
+
 def _post_review_comments(
     gh: Any,
     pr_number: int,
@@ -220,32 +245,50 @@ def _post_review_comments(
     comments: list[dict],
     score: float,
 ) -> None:
-    """Post findings as a PR review. Tries inline comments first; falls back to body-only."""
-    blocking = score < QUALITY_THRESHOLD or any("🔒" in c["body"] for c in comments)
-    event    = "REQUEST_CHANGES" if blocking else "COMMENT"
-    header   = f"**AI Engineering Review** — Score: {score:.0f}/100\n\n"
+    """Post findings as a PR review. Inline for lines in the diff; rest go in the body."""
+    # Always use COMMENT — REQUEST_CHANGES is rejected when token owner == PR author,
+    # and the AI guardrails prohibit autonomous review decisions regardless.
+    event  = "COMMENT"
+    header = f"**AI Engineering Review** — Score: {score:.0f}/100\n\n"
 
-    # Try inline comments (batches of 30)
-    inline_ok = False
-    for i in range(0, len(comments), 30):
-        batch = comments[i:i + 30]
-        try:
-            gh.post_review(pr_number, head_sha, header if i == 0 else "", event if i == 0 else "COMMENT", batch)
-            inline_ok = True
-        except Exception as e:
-            log.warning("Inline review batch %d failed (%s) — will include in body", i, e)
-            break
+    # Split into inline-able vs body-only findings
+    valid_lines  = _valid_diff_lines(gh, pr_number)
+    inline       = [c for c in comments if (c["path"], c["line"]) in valid_lines]
+    body_only    = [c for c in comments if (c["path"], c["line"]) not in valid_lines]
 
-    # Fallback: include all findings as a formatted body-only review
-    if not inline_ok and comments:
-        lines = [header, "### Findings\n"]
-        for c in comments:
-            lines.append(f"- `{c['path']}:{c['line']}` — {c['body'].splitlines()[0]}")
-        body = "\n".join(lines)
+    log.info("%d inline comments, %d body-only (not in diff)", len(inline), len(body_only))
+
+    # Build body: header + any findings that can't be inlined
+    body_parts = [header]
+    if body_only:
+        body_parts.append("### Additional Findings (outside diff)\n")
+        for c in body_only:
+            first_line = c["body"].splitlines()[0]
+            body_parts.append(f"- `{c['path']}:{c['line']}` — {first_line}")
+    body = "\n".join(body_parts)
+
+    # Post inline comments in batches of 30
+    posted = False
+    if inline:
+        for i in range(0, len(inline), 30):
+            batch = inline[i:i + 30]
+            try:
+                gh.post_review(
+                    pr_number, head_sha,
+                    body if i == 0 else "",
+                    "COMMENT",
+                    batch,
+                )
+                posted = True
+            except Exception as e:
+                log.warning("Inline batch %d failed (%s) — falling back to body-only", i, e)
+                break
+
+    if not posted:
         try:
-            gh.post_review(pr_number, head_sha, body, event, [])
+            gh.post_review(pr_number, head_sha, body, "COMMENT", [])
         except Exception as e:
-            log.warning("Body-only review also failed: %s", e)
+            log.error("Body-only review also failed: %s", e)
 
 
 def _build_summary(
