@@ -1,0 +1,14 @@
+{{- range $name, $cfg := dict "postgres" .Values.postgres "neo4j" .Values.neo4j "chromadb" .Values.chromadb "redis" .Values.redis "minio" .Values.minio }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-pvc
+  namespace: {{ $.Values.namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ $cfg.storageClass | default "local-path" }}
+  resources:
+    requests:
+      storage: {{ $cfg.storage | default "2Gi" }}
+{{- end }}

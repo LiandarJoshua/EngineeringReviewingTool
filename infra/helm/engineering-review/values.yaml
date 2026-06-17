@@ -1,0 +1,58 @@
+namespace: engineering-review
+
+ollama:
+  host: "http://host-gateway:11434"
+
+api:
+  replicas: 2
+  image: engineering-review-api:latest
+  imagePullPolicy: Never  # local image, no registry
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+  hpa:
+    minReplicas: 1
+    maxReplicas: 4
+    cpuThreshold: 70
+
+celery:
+  replicas: 1
+  image: engineering-review-api:latest
+  imagePullPolicy: Never
+  concurrency: 2
+
+frontend:
+  replicas: 1
+  image: engineering-review-frontend:latest
+  imagePullPolicy: Never
+
+postgres:
+  image: postgres:16-alpine
+  storage: 10Gi
+  storageClass: local-path  # k3s default
+
+neo4j:
+  image: neo4j:5-community
+  storage: 5Gi
+  storageClass: local-path
+
+chromadb:
+  image: chromadb/chroma:latest
+  storage: 5Gi
+  storageClass: local-path
+
+redis:
+  image: redis:7-alpine
+  storage: 1Gi
+
+minio:
+  image: minio/minio:latest
+  storage: 10Gi
+
+ingress:
+  host: engineering-review.local
+  tls: false

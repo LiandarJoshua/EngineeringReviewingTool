@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: {{ .Values.namespace }}
+spec:
+  replicas: {{ .Values.celery.replicas }}
+  selector:
+    matchLabels:
+      app: celery-worker
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+    spec:
+      hostAliases:
+        - ip: "{{ .Values.hostGatewayIP | default "172.17.0.1" }}"
+          hostnames: ["host-gateway"]
+      containers:
+        - name: celery
+          image: {{ .Values.celery.image }}
+          imagePullPolicy: {{ .Values.celery.imagePullPolicy }}
+          command:
+            - celery
+            - -A
+            - app.worker
+            - worker
+            - --loglevel=info
+            - --concurrency={{ .Values.celery.concurrency }}
+            - -Q
+            - reviews,training
+          envFrom:
+            - configMapRef:
+                name: erp-config
+            - secretRef:
+                name: erp-secrets
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://erp_user:$(POSTGRES_PASSWORD)@postgres:5432/engineering_review"
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis:6379/0"
+          volumeMounts:
+            - name: repos
+              mountPath: /tmp/repos
+      volumes:
+        - name: repos
+          emptyDir: {}
