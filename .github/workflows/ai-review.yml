@@ -1,0 +1,113 @@
+name: AI Engineering Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Also fires when CI tests fail on a PR branch
+  workflow_run:
+    workflows: ["CI Tests"]
+    types: [completed]
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    name: AI Code Review (Junior Partner)
+    runs-on: ubuntu-latest
+    # Skip for auto-merge bots and Dependabot
+    if: |
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'github-actions[bot]'
+
+    permissions:
+      pull-requests: write   # post review comments
+      contents: read         # checkout code
+      issues: write          # apply labels
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR metadata
+        id: pr_meta
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "head_sha=$HEAD_SHA"   >> $GITHUB_OUTPUT
+
+      - name: Trigger AI Review
+        id: trigger
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${{ secrets.REVIEW_API_URL }}/webhooks/pr-review" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "repo_full_name":    "${{ github.repository }}",
+              "pr_number":         ${{ steps.pr_meta.outputs.pr_number }},
+              "head_sha":          "${{ steps.pr_meta.outputs.head_sha }}",
+              "pr_title":          "${{ github.event.pull_request.title }}",
+              "pr_description":    "${{ github.event.pull_request.body }}",
+              "author":            "${{ github.event.pull_request.user.login }}",
+              "base_branch":       "${{ github.event.pull_request.base.ref }}",
+              "github_token":      "${{ secrets.GITHUB_TOKEN }}",
+              "experience_level":  "mid",
+              "quality_threshold": 70
+            }')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+          echo "response=$BODY" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::AI review API returned $HTTP_CODE — review skipped"
+          else
+            echo "::notice::AI review queued: $BODY"
+          fi
+
+      # Hard guardrail: this job is COMMENT-only.
+      # The AI review platform enforces:
+      #   - No auto-merge
+      #   - No autonomous "Approve" GitHub review events
+      #   - Critical/security issues always escalated to human reviewers
+      - name: Post guardrail notice
+        if: always()
+        run: |
+          echo "::notice::GUARDRAILS ACTIVE — AI acts as junior partner only."
+          echo "::notice::Human approval required before merge."
+          echo "::notice::AI never approves, never auto-merges."
+
+  # Optional: block merge if AI flags critical issues (label-based protection)
+  # Configure in GitHub: Settings → Branches → Branch protection rules
+  # Add status check: "ai-review" and require it to pass
+  # Add label protection: block merge when "ai:needs-human-review" label is present
+  enforce-guardrails:
+    name: Guardrail Check
+    runs-on: ubuntu-latest
+    needs: ai-review
+    if: always()
+    steps:
+      - name: Check for blocking labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.payload.pull_request?.number || 0,
+            });
+            const blockingLabels = labels
+              .map(l => l.name)
+              .filter(n => n === 'ai:needs-human-review' || n === 'ai:quality-gate-failed');
+
+            if (blockingLabels.length > 0) {
+              core.warning(
+                `PR blocked by AI guardrails: ${blockingLabels.join(', ')}. ` +
+                `A human engineer must review and remove these labels before merge.`
+              );
+              // Don't fail CI — just warn. Human removal of label is the gate.
+            } else {
+              core.notice('No AI guardrail labels found — OK to proceed through normal review process.');
+            }
